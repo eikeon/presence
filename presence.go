@@ -11,13 +11,17 @@ import (
 
 var hosts map[string]*Host = map[string]*Host{}
 
+type Presence struct {
+	Name   string
+	Status bool
+}
+
 type Host struct {
 	Name    string
 	Address net.IP
-	Status  bool
 }
 
-func (h *Host) ping(ch chan Host) {
+func (h Host) ping(ch chan Presence) {
 	c := make(chan bool)
 
 	ports := []string{"22", "62078"}
@@ -40,19 +44,17 @@ func (h *Host) ping(ch chan Host) {
 		select {
 		case r := <-c:
 			if r == true {
-				h.Status = true
-				ch <- *h
+				ch <- Presence{h.Name, true}
 				return
 			}
 		case <-timeout:
 			break
 		}
 	}
-	h.Status = false
-	ch <- *h
+	ch <- Presence{h.Name, false}
 }
 
-func Listen(current map[string]bool) chan Host {
+func Listen(current map[string]bool) chan Presence {
 	for name, _ := range current {
 		hosts[name] = &Host{Name: name}
 		if a, err := net.ResolveTCPAddr("tcp4", name+".local:80"); err == nil {
@@ -60,17 +62,18 @@ func Listen(current map[string]bool) chan Host {
 		}
 	}
 
-	ch := make(chan Host)
-	mcaddr, err := net.ResolveUDPAddr("udp", "224.0.0.251:5353") // mdns/bonjour
-	if err != nil {
-		log.Fatal(err)
-	}
-	conn, err := net.ListenMulticastUDP("udp", nil, mcaddr)
-	if err != nil {
-		log.Fatal(err)
-	}
+	hostch := make(chan Host)
 
 	go func() {
+		mcaddr, err := net.ResolveUDPAddr("udp", "224.0.0.251:5353") // mdns/bonjour
+		if err != nil {
+			log.Fatal(err)
+		}
+		conn, err := net.ListenMulticastUDP("udp", nil, mcaddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		for {
 			buf := make([]byte, dns.MaxMsgSize)
 			read, _, err := conn.ReadFromUDP(buf)
@@ -85,13 +88,7 @@ func Listen(current map[string]bool) chan Host {
 						rh := rr.Header()
 						if rh.Rrtype == dns.TypeA {
 							name := strings.NewReplacer(".local.", "").Replace(rh.Name)
-							h, ok := hosts[name]
-							if !ok {
-								h = &Host{Name: name, Address: rr.(*dns.A).A}
-								hosts[name] = h
-							}
-							h.Address = rr.(*dns.A).A
-							go h.ping(ch)
+							hostch <- Host{name, rr.(*dns.A).A}
 						}
 					}
 				}
@@ -101,10 +98,19 @@ func Listen(current map[string]bool) chan Host {
 		}
 	}()
 
+	ch := make(chan Presence)
 	go func() {
 		c := time.Tick(60 * time.Second)
 		for {
 			select {
+			case host := <-hostch:
+				h, ok := hosts[host.Name]
+				if !ok {
+					h = &Host{Name: host.Name, Address: host.Address}
+					hosts[host.Name] = h
+				}
+				h.Address = host.Address
+				go h.ping(ch)
 			case <-c:
 				for _, h := range hosts {
 					go h.ping(ch)
